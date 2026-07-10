@@ -6,3 +6,6 @@ riderModule.iml
 .idea/
 .vs/
 ServerSyncModTemplate.sln.DotSettings.user
+Thunderstore/*_v*/
+Thunderstore/*.zip
+Nexus/

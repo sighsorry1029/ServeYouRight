@@ -1,9 +1,10 @@
 {
-  "name": "ServerSyncModTemplate",
-  "version_number": "1.0.0",
-  "website_url": "https://discord.gg/pdHgy6Bsng",
-  "description": "Your mod description goes here. Do not forget to replace the icon.png file with your own. Must be 256x256. Your Readme.md file will be copied from the one in your project folder.",
+  "name": "ServeYouRight",
+  "version_number": "1.0.3",
+  "website_url": "https://discord.gg/mbkPcvu9ax",
+  "description": "You can place Modded Foods with ServingTray!",
   "dependencies": [
-    "denikson-BepInExPack_Valheim-5.4.2202"
+    "denikson-BepInExPack_Valheim-5.4.2333",
+    "ValheimModding-Jotunn-2.29.1"
   ]
 }
