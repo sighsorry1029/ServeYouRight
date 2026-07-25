@@ -17,7 +17,7 @@ namespace ServerSyncModTemplate;
 public class ServerSyncModTemplatePlugin : BaseUnityPlugin
 {
     internal const string ModName = "ServeYouRight";
-    internal const string ModVersion = "1.0.3";
+    internal const string ModVersion = "1.0.4";
     internal const string Author = "sighsorry";
     private const string ModGUID = $"{Author}.{ModName}";
     private static string ConfigFileName = $"{ModGUID}.cfg";
@@ -49,16 +49,17 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
 
             Assembly assembly = Assembly.GetExecutingAssembly();
             _harmony.PatchAll(assembly);
-            SetupWatcher();
             SaveConfigWithoutWatcher();
+            SetupWatcher();
         });
     }
 
     private void OnDestroy()
     {
         Localization.OnLanguageChange -= OnLanguageChange;
-        SaveWithRespectToConfigSet();
         _watcher?.Dispose();
+        _watcher = null;
+        RunWithConfigAutoSaveDisabled(SaveConfigWithoutWatcher);
     }
 
     private void OnLanguageChange()
@@ -85,6 +86,7 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
             return;
         }
 
+        _lastConfigReloadTime = now;
         lock (_reloadLock)
         {
             if (!File.Exists(ConfigFileFullPath))
@@ -96,29 +98,26 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
             try
             {
                 ServerSyncModTemplateLogger.LogDebug("Reloading configuration...");
-                SaveWithRespectToConfigSet(true);
+                ReloadConfigValues();
                 ServerSyncModTemplateLogger.LogInfo("Configuration reload complete.");
             }
             catch (Exception ex)
             {
                 ServerSyncModTemplateLogger.LogError($"Error reloading configuration: {ex.Message}");
             }
+            finally
+            {
+                _lastConfigReloadTime = DateTime.UtcNow;
+            }
         }
-
-        _lastConfigReloadTime = now;
     }
 
-    private void SaveWithRespectToConfigSet(bool reload = false)
+    private void ReloadConfigValues()
     {
         RunWithConfigAutoSaveDisabled(() =>
         {
-            if (reload)
-            {
-                Config.Reload();
-                FeasterFoodInjector.RefreshFoodPiecesAndMenu(ObjectDB.instance);
-            }
-
-            SaveConfigWithoutWatcher();
+            Config.Reload();
+            FeasterFoodInjector.RefreshFoodPiecesAndMenu(ObjectDB.instance);
         });
     }
 
