@@ -17,7 +17,7 @@ namespace ServerSyncModTemplate;
 public class ServerSyncModTemplatePlugin : BaseUnityPlugin
 {
     internal const string ModName = "ServeYouRight";
-    internal const string ModVersion = "1.0.4";
+    internal const string ModVersion = "1.0.5";
     internal const string Author = "sighsorry";
     private const string ModGUID = $"{Author}.{ModName}";
     private static string ConfigFileName = $"{ModGUID}.cfg";
@@ -181,18 +181,24 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
                 return existing;
             }
 
-            if (_instance == null)
+            ServerSyncModTemplatePlugin? instance = _instance;
+            if (instance == null)
             {
                 throw new InvalidOperationException("Plugin instance is not initialized.");
             }
 
             string section = $"ServingTray - {SanitizeConfigText(mod.DisplayName)} ({SanitizeConfigText(mod.Id)})";
 
-            PerModCategoryConfig created = new(
-                _instance.config(section, "Food", Toggle.On, $"If on, '{mod.DisplayName}' Food items go to 'Food - {mod.DisplayName}'. If off, they merge into vanilla Food.", 300),
-                _instance.config(section, "Meads", Toggle.On, $"If on, '{mod.DisplayName}' Mead items go to 'Meads - {mod.DisplayName}'. If off, they merge into vanilla Meads.", 200),
-                _instance.config(section, "Feasts", Toggle.On, $"If on, '{mod.DisplayName}' Feast items go to 'Feasts - {mod.DisplayName}'. If off, they merge into vanilla Feasts.", 100)
-            );
+            PerModCategoryConfig created = null!;
+            // Bind auto-saves new entries; let the pending flush save the complete batch.
+            instance.RunWithConfigAutoSaveDisabled(() =>
+            {
+                created = new PerModCategoryConfig(
+                    instance.config(section, "Food", Toggle.On, $"If on, '{mod.DisplayName}' Food items go to 'Food - {mod.DisplayName}'. If off, they merge into vanilla Food.", 300),
+                    instance.config(section, "Meads", Toggle.On, $"If on, '{mod.DisplayName}' Mead items go to 'Meads - {mod.DisplayName}'. If off, they merge into vanilla Meads.", 200),
+                    instance.config(section, "Feasts", Toggle.On, $"If on, '{mod.DisplayName}' Feast items go to 'Feasts - {mod.DisplayName}'. If off, they merge into vanilla Feasts.", 100)
+                );
+            });
 
             PerModConfigs[mod.Id] = created;
             _pendingDynamicConfigSave = true;
@@ -268,6 +274,20 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
     }
 
 #endregion
+}
+
+internal sealed class PerModCategoryConfig
+{
+    public PerModCategoryConfig(ConfigEntry<ServerSyncModTemplatePlugin.Toggle> food, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> meads, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> feasts)
+    {
+        Food = food;
+        Meads = meads;
+        Feasts = feasts;
+    }
+
+    public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Food { get; }
+    public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Meads { get; }
+    public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Feasts { get; }
 }
 
 [HarmonyPatch(typeof(ObjectDB), nameof(ObjectDB.Awake))]
@@ -974,9 +994,10 @@ internal static class FeasterFoodInjector
         {
             string trimmed = baseLabel.Trim();
             string localizable = trimmed;
+            bool isLocalizationTokenKey = LooksLikeLocalizationTokenKey(trimmed);
             // Some mods provide raw token keys without '$' (e.g. vc_hud_food).
             // Prefix '$' and resolve immediately to current language text.
-            if (LooksLikeLocalizationTokenKey(trimmed) && !trimmed.StartsWith("$", StringComparison.Ordinal))
+            if (isLocalizationTokenKey && !trimmed.StartsWith("$", StringComparison.Ordinal))
             {
                 localizable = $"${trimmed}";
             }
@@ -990,7 +1011,7 @@ internal static class FeasterFoodInjector
                 }
             }
 
-            if (LooksLikeLocalizationTokenKey(trimmed))
+            if (isLocalizationTokenKey)
             {
                 return GetFallbackCategoryLabel(category);
             }
@@ -1011,11 +1032,6 @@ internal static class FeasterFoodInjector
         if (value.StartsWith("$", StringComparison.Ordinal))
         {
             return true;
-        }
-
-        if (value.IndexOfAny(new[] { ' ', '\t', '\r', '\n' }) >= 0)
-        {
-            return false;
         }
 
         // Typical token keys are lower_snake_case (sometimes with dots/hyphens).
@@ -1174,20 +1190,6 @@ internal sealed class ModCategoryInfo
     public FoodSourceMod SourceMod { get; }
 }
 
-internal sealed class PerModCategoryConfig
-{
-    public PerModCategoryConfig(ConfigEntry<ServerSyncModTemplatePlugin.Toggle> food, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> meads, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> feasts)
-    {
-        Food = food;
-        Meads = meads;
-        Feasts = feasts;
-    }
-
-    public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Food { get; }
-    public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Meads { get; }
-    public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Feasts { get; }
-}
-
 internal static class KnownCloneSourceBridge
 {
     private const string WackyGuid = "WackyMole.WackysDatabase";
@@ -1196,7 +1198,6 @@ internal static class KnownCloneSourceBridge
     private static bool _initialized;
     private static MethodInfo? _wackyGetClonedMap;
     private static string _wackyDisplayName = DefaultWackyName;
-    private static readonly HashSet<string> WackyCloneHitCache = new(StringComparer.OrdinalIgnoreCase);
 
     public static bool TryResolveSourceMod(string prefabName, out FoodSourceMod sourceMod)
     {
@@ -1205,12 +1206,6 @@ internal static class KnownCloneSourceBridge
         if (_wackyGetClonedMap == null)
         {
             return false;
-        }
-
-        if (WackyCloneHitCache.Contains(prefabName))
-        {
-            sourceMod = new FoodSourceMod(WackyGuid, _wackyDisplayName);
-            return true;
         }
 
         try
@@ -1222,7 +1217,6 @@ internal static class KnownCloneSourceBridge
                 return false;
             }
 
-            WackyCloneHitCache.Add(prefabName);
             sourceMod = new FoodSourceMod(WackyGuid, _wackyDisplayName);
             return true;
         }
