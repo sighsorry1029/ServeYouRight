@@ -13,11 +13,12 @@ using UnityEngine;
 namespace ServerSyncModTemplate;
 
 [BepInPlugin(ModGUID, ModName, ModVersion)]
-[BepInDependency("com.jotunn.jotunn", BepInDependency.DependencyFlags.HardDependency)]
+[BepInDependency("sighsorry.DataForge", BepInDependency.DependencyFlags.SoftDependency)]
+[BepInDependency("WackyMole.WackysDatabase", BepInDependency.DependencyFlags.SoftDependency)]
 public class ServerSyncModTemplatePlugin : BaseUnityPlugin
 {
     internal const string ModName = "ServeYouRight";
-    internal const string ModVersion = "1.0.5";
+    internal const string ModVersion = "1.0.7";
     internal const string Author = "sighsorry";
     private const string ModGUID = $"{Author}.{ModName}";
     private static string ConfigFileName = $"{ModGUID}.cfg";
@@ -44,7 +45,7 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
         _instance = this;
         RunWithConfigAutoSaveDisabled(() =>
         {
-            JotunnBridge.InitializeAndEnableModQuery();
+            FoodSourceCatalog.Initialize();
             Localization.OnLanguageChange += OnLanguageChange;
 
             Assembly assembly = Assembly.GetExecutingAssembly();
@@ -59,7 +60,23 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
         Localization.OnLanguageChange -= OnLanguageChange;
         _watcher?.Dispose();
         _watcher = null;
-        RunWithConfigAutoSaveDisabled(SaveConfigWithoutWatcher);
+        try { RunWithConfigAutoSaveDisabled(SaveConfigWithoutWatcher); }
+        finally
+        {
+            FoodSourceCatalog.Dispose();
+            ServingTrayMenu.Dispose();
+            FeasterFoodInjector.ResetWorld();
+            _harmony.UnpatchSelf();
+            PerModConfigs.Clear();
+            _instance = null;
+        }
+    }
+
+    private void Update()
+    {
+        if (!FoodSourceCatalog.RefreshPending) return;
+        FoodSourceCatalog.RefreshPending = false;
+        FeasterFoodInjector.RefreshFoodPiecesAndMenu(ObjectDB.instance);
     }
 
     private void OnLanguageChange()
@@ -165,6 +182,7 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
         PerModCategoryConfig cfg = GetOrCreatePerModConfig(mod);
         return category switch
         {
+            Piece.PieceCategory.Misc => cfg.Misc.Value == Toggle.On,
             Piece.PieceCategory.Food => cfg.Food.Value == Toggle.On,
             Piece.PieceCategory.Meads => cfg.Meads.Value == Toggle.On,
             Piece.PieceCategory.Feasts => cfg.Feasts.Value == Toggle.On,
@@ -194,6 +212,7 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
             instance.RunWithConfigAutoSaveDisabled(() =>
             {
                 created = new PerModCategoryConfig(
+                    instance.config(section, "Misc", Toggle.On, $"If on, '{mod.DisplayName}' Misc pieces on Feaster go to 'Misc - {mod.DisplayName}'. If off, they merge into vanilla Misc.", 400),
                     instance.config(section, "Food", Toggle.On, $"If on, '{mod.DisplayName}' Food items go to 'Food - {mod.DisplayName}'. If off, they merge into vanilla Food.", 300),
                     instance.config(section, "Meads", Toggle.On, $"If on, '{mod.DisplayName}' Mead items go to 'Meads - {mod.DisplayName}'. If off, they merge into vanilla Meads.", 200),
                     instance.config(section, "Feasts", Toggle.On, $"If on, '{mod.DisplayName}' Feast items go to 'Feasts - {mod.DisplayName}'. If off, they merge into vanilla Feasts.", 100)
@@ -278,23 +297,27 @@ public class ServerSyncModTemplatePlugin : BaseUnityPlugin
 
 internal sealed class PerModCategoryConfig
 {
-    public PerModCategoryConfig(ConfigEntry<ServerSyncModTemplatePlugin.Toggle> food, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> meads, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> feasts)
+    public PerModCategoryConfig(ConfigEntry<ServerSyncModTemplatePlugin.Toggle> misc, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> food, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> meads, ConfigEntry<ServerSyncModTemplatePlugin.Toggle> feasts)
     {
+        Misc = misc;
         Food = food;
         Meads = meads;
         Feasts = feasts;
     }
 
+    public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Misc { get; }
     public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Food { get; }
     public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Meads { get; }
     public ConfigEntry<ServerSyncModTemplatePlugin.Toggle> Feasts { get; }
 }
 
-[HarmonyPatch(typeof(ObjectDB), nameof(ObjectDB.Awake))]
+[HarmonyPatch(typeof(ObjectDB), "Awake")]
 public static class ObjectDbAwakePatch
 {
+    [HarmonyPriority(Priority.Last)]
     private static void Postfix(ObjectDB __instance)
     {
+        FeasterFoodInjector.BeginWorld();
         FeasterFoodInjector.Inject(__instance);
     }
 }
@@ -302,37 +325,46 @@ public static class ObjectDbAwakePatch
 [HarmonyPatch(typeof(ObjectDB), nameof(ObjectDB.CopyOtherDB))]
 public static class ObjectDbCopyOtherDbPatch
 {
+    [HarmonyPriority(Priority.Last)]
     private static void Postfix(ObjectDB __instance)
     {
+        FeasterFoodInjector.BeginWorld();
         FeasterFoodInjector.Inject(__instance);
     }
 }
 
-[HarmonyPatch(typeof(Player), nameof(Player.SetPlaceMode))]
+[HarmonyPatch(typeof(Player), "SetPlaceMode")]
 public static class PlayerSetPlaceModePatch
 {
     private static void Postfix(Player __instance, PieceTable buildPieces)
     {
-        if (__instance != Player.m_localPlayer || buildPieces == null || !buildPieces.m_canRemoveFeasts)
+        if (__instance != Player.m_localPlayer || !FeasterFoodInjector.IsFeasterTool(buildPieces))
         {
             return;
         }
 
-        FeasterFoodInjector.RefreshFoodPiecesAndMenu(ObjectDB.instance, buildPieces);
+        FeasterFoodInjector.RefreshFoodPiecesAndMenu(ObjectDB.instance);
     }
 }
 
-[HarmonyPatch(typeof(PieceTable), nameof(PieceTable.UpdateAvailable))]
-public static class PieceTableUpdateAvailablePatch
+[HarmonyPatch(typeof(Game), "Start")]
+internal static class GameStartedPatch
 {
-    private static void Postfix(PieceTable __instance)
+    [HarmonyPriority(Priority.Last)]
+    private static void Postfix()
     {
-        if (__instance == null || !__instance.m_canRemoveFeasts)
-        {
-            return;
-        }
+        FeasterFoodInjector.BeginWorld();
+        FeasterFoodInjector.RefreshFoodPiecesAndMenu(ObjectDB.instance);
+    }
+}
 
-        FeasterFoodInjector.ApplyCustomCategoryLabels(__instance);
+[HarmonyPatch(typeof(ZNetScene), "OnDestroy")]
+internal static class FoodWorldShutdownPatch
+{
+    private static void Prefix()
+    {
+        FoodSourceCatalog.ResetWorld();
+        FeasterFoodInjector.ResetWorld();
     }
 }
 
@@ -369,25 +401,36 @@ public static class ItemDropMakePiecePatch
 internal static class FeasterFoodInjector
 {
     private static bool _isInjecting;
-    private static readonly Dictionary<string, ModCategoryInfo> ModCategoryCache = new(StringComparer.OrdinalIgnoreCase);
+    private static bool _shuttingDown;
+    private static readonly Dictionary<Piece, (Piece.PieceCategory Category, FoodSourceMod? Source)> FoodGroups = new();
+    private static readonly Action<Player> UpdateKnownRecipes = AccessTools.MethodDelegate<Action<Player>>(AccessTools.Method(typeof(Player), "UpdateKnownRecipesList"));
+    private static readonly Action<Player> UpdateAvailablePieces = AccessTools.MethodDelegate<Action<Player>>(AccessTools.Method(typeof(Player), "UpdateAvailablePiecesList"));
     private static readonly Dictionary<string, FoodSourceMod> SourceModHitCache = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly object ModCategoryLock = new();
-
-    internal static void RefreshFoodPiecesAndMenu(ObjectDB? objectDb, PieceTable? buildPieces = null)
+    internal static void ResetWorld()
     {
+        _shuttingDown = true;
+        FoodGroups.Clear();
+        SourceModHitCache.Clear();
+    }
+
+    internal static void BeginWorld() => _shuttingDown = false;
+
+    internal static void RefreshFoodPiecesAndMenu(ObjectDB? objectDb)
+    {
+        if (_shuttingDown || objectDb == null) return;
         Inject(objectDb);
         Player? localPlayer = Player.m_localPlayer;
         if (localPlayer != null)
         {
-            localPlayer.UpdateKnownRecipesList();
-            localPlayer.UpdateAvailablePiecesList();
-            ApplyCustomCategoryLabels(buildPieces ?? localPlayer.m_buildPieces);
+            UpdateKnownRecipes(localPlayer);
+            UpdateAvailablePieces(localPlayer);
+            ServingTrayMenu.Refresh();
         }
     }
 
     public static void Inject(ObjectDB? objectDb)
     {
-        if (_isInjecting || objectDb == null)
+        if (_isInjecting || _shuttingDown || objectDb == null)
         {
             return;
         }
@@ -395,21 +438,17 @@ internal static class FeasterFoodInjector
         _isInjecting = true;
         try
         {
+            PieceTable? feasterTable = GetFeasterPieceTable(objectDb);
+            if (feasterTable == null) return;
+            FoodSourceCatalog.Refresh();
+            SourceModHitCache.Clear();
+            FoodGroups.Clear();
             List<CandidateFood> candidateFoods = GetCandidateFoods(objectDb);
-            if (candidateFoods.Count == 0)
+            int added = InjectIntoTable(feasterTable, candidateFoods);
+            UpdateExistingMenuGroups(feasterTable);
+            if (added > 0)
             {
-                return;
-            }
-
-            foreach (PieceTable feasterTable in GetFeasterPieceTables(objectDb))
-            {
-                int added = InjectIntoTable(feasterTable, candidateFoods);
-                if (added > 0)
-                {
-                    ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogInfo($"Added {added} mod food pieces to feaster table '{feasterTable.name}'.");
-                }
-
-                ApplyCustomCategoryLabels(feasterTable);
+                ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogInfo($"Added {added} mod food pieces to feaster table '{feasterTable.name}'.");
             }
         }
         catch (Exception ex)
@@ -587,40 +626,30 @@ internal static class FeasterFoodInjector
         return shared.m_food > 0f || shared.m_foodStamina > 0f || shared.m_foodEitr > 0f || shared.m_isDrink;
     }
 
-    private static IEnumerable<PieceTable> GetFeasterPieceTables(ObjectDB objectDb)
+    internal static PieceTable? GetFeasterPieceTable(ObjectDB? objectDb)
     {
-        HashSet<PieceTable> uniqueTables = new();
-        foreach (GameObject itemPrefab in objectDb.m_items)
+        GameObject? feaster = objectDb != null ? objectDb.GetItemPrefab("Feaster") : null;
+        return feaster != null ? feaster.GetComponent<ItemDrop>()?.m_itemData?.m_shared?.m_buildPieces : null;
+    }
+
+    internal static bool IsFeasterTool(PieceTable? table) =>
+        table != null && table == GetFeasterPieceTable(ObjectDB.instance);
+
+    private static void UpdateExistingMenuGroups(PieceTable table)
+    {
+        // Include pieces already supplied by the game or another mod, including
+        // Misc. Grouping does not change their category, requirements or prefab.
+        foreach (GameObject prefab in table.m_pieces)
         {
-            if (itemPrefab == null)
-            {
-                continue;
-            }
-
-            ItemDrop? itemDrop = itemPrefab.GetComponent<ItemDrop>();
-            PieceTable? pieceTable = itemDrop?.m_itemData?.m_shared?.m_buildPieces;
-            if (pieceTable == null)
-            {
-                continue;
-            }
-
-            if (!pieceTable.m_canRemoveFeasts)
-            {
-                continue;
-            }
-
-            bool supportsFoodTabs = pieceTable.m_categories.Contains(Piece.PieceCategory.Food) ||
-                                    pieceTable.m_categories.Contains(Piece.PieceCategory.Meads) ||
-                                    pieceTable.m_categories.Contains(Piece.PieceCategory.Feasts);
-            if (!supportsFoodTabs)
-            {
-                continue;
-            }
-
-            if (uniqueTables.Add(pieceTable))
-            {
-                yield return pieceTable;
-            }
+            if (prefab == null || !prefab.TryGetComponent(out Piece piece) || FoodGroups.ContainsKey(piece) ||
+                piece.m_repairPiece || piece.m_removePiece) continue;
+            Piece.PieceCategory category = piece.m_category;
+            if (category != Piece.PieceCategory.Misc && category != Piece.PieceCategory.Food &&
+                category != Piece.PieceCategory.Meads && category != Piece.PieceCategory.Feasts) continue;
+            FoodSourceMod? source = null;
+            if (TryResolveFoodSourceMod(prefab, out FoodSourceMod owner) &&
+                ServerSyncModTemplatePlugin.UseModSpecificTab(owner, category)) source = owner;
+            FoodGroups[piece] = (category, source);
         }
     }
 
@@ -643,7 +672,7 @@ internal static class FeasterFoodInjector
             }
 
             Piece.PieceCategory baseCategory = candidateFood.Category;
-            Piece.PieceCategory targetCategory = ResolveTargetCategory(table, sourceItemDrop.gameObject, baseCategory);
+            Piece.PieceCategory targetCategory = baseCategory;
 
             if (!TryGetTemplate(table, targetCategory, out Piece templatePiece, out WearNTear templateWearNTear))
             {
@@ -654,6 +683,11 @@ internal static class FeasterFoodInjector
             {
                 continue;
             }
+
+            FoodSourceMod? groupSource = null;
+            if (TryResolveFoodSourceMod(sourceItemDrop.gameObject, out FoodSourceMod owner) &&
+                ServerSyncModTemplatePlugin.UseModSpecificTab(owner, baseCategory)) groupSource = owner;
+            FoodGroups[placePrefab.GetComponent<Piece>()] = (baseCategory, groupSource);
 
             if (!table.m_pieces.Contains(placePrefab))
             {
@@ -673,36 +707,14 @@ internal static class FeasterFoodInjector
         EnsureBaseCategoryExists(table, Piece.PieceCategory.Feasts, GetBaseCategoryLabel(table, Piece.PieceCategory.Feasts));
     }
 
-    public static void ApplyCustomCategoryLabels(PieceTable? table)
+    internal static void GetMenuGroup(PieceTable table, Piece piece, out string key, out string label)
     {
-        if (table == null)
-        {
-            return;
-        }
-
-        List<ModCategoryInfo> infos;
-        lock (ModCategoryLock)
-        {
-            infos = ModCategoryCache.Values.ToList();
-        }
-
-        foreach (ModCategoryInfo info in infos)
-        {
-            int categoryIndex = table.m_categories.IndexOf(info.Category);
-            if (categoryIndex < 0)
-            {
-                continue;
-            }
-
-            while (table.m_categoryLabels.Count <= categoryIndex)
-            {
-                table.m_categoryLabels.Add(string.Empty);
-            }
-
-            string baseLabel = GetBaseCategoryLabel(table, info.BaseCategory);
-            string localizedCategory = ResolveCategoryDisplayLabel(info.BaseCategory, baseLabel);
-            table.m_categoryLabels[categoryIndex] = $"{localizedCategory} - {info.SourceMod.DisplayName}";
-        }
+        Piece.PieceCategory category = piece.m_category;
+        FoodSourceMod? source = null;
+        if (FoodGroups.TryGetValue(piece, out var group)) { category = group.Category; source = group.Source; }
+        key = ((int)category).ToString() + ":" + (source?.Id ?? "");
+        label = ResolveCategoryDisplayLabel(category, GetBaseCategoryLabel(table, category));
+        if (source.HasValue) label += " - " + source.Value.DisplayName;
     }
 
     private static bool TryGetTemplate(PieceTable table, Piece.PieceCategory category, out Piece templatePiece, out WearNTear templateWearNTear)
@@ -811,6 +823,7 @@ internal static class FeasterFoodInjector
 
     private static void CopyPieceTemplate(Piece source, Piece destination)
     {
+        destination.m_usage = source.m_usage;
         destination.m_targetNonPlayerBuilt = source.m_targetNonPlayerBuilt;
         destination.m_icon = source.m_icon;
         destination.m_isUpgrade = source.m_isUpgrade;
@@ -933,24 +946,6 @@ internal static class FeasterFoodInjector
         return existing;
     }
 
-    private static Piece.PieceCategory ResolveTargetCategory(PieceTable table, GameObject foodPrefab, Piece.PieceCategory baseCategory)
-    {
-        string baseLabel = GetBaseCategoryLabel(table, baseCategory);
-        EnsureBaseCategoryExists(table, baseCategory, baseLabel);
-
-        if (!TryResolveFoodSourceMod(foodPrefab, out FoodSourceMod sourceMod))
-        {
-            return baseCategory;
-        }
-
-        if (!ServerSyncModTemplatePlugin.UseModSpecificTab(sourceMod, baseCategory))
-        {
-            return baseCategory;
-        }
-
-        return ResolveOrCreateModCategory(baseCategory, sourceMod);
-    }
-
     private static string GetBaseCategoryLabel(PieceTable table, Piece.PieceCategory category)
     {
         int categoryIndex = table.m_categories.IndexOf(category);
@@ -964,28 +959,6 @@ internal static class FeasterFoodInjector
         }
 
         return GetFallbackCategoryLabel(category);
-    }
-
-    private static Piece.PieceCategory ResolveOrCreateModCategory(Piece.PieceCategory baseCategory, FoodSourceMod sourceMod)
-    {
-        string cacheKey = $"{sourceMod.Id}:{(int)baseCategory}";
-        lock (ModCategoryLock)
-        {
-            if (ModCategoryCache.TryGetValue(cacheKey, out ModCategoryInfo? cachedCategory))
-            {
-                return cachedCategory.Category;
-            }
-
-            string stableCategoryKey = BuildStableCategoryKey(baseCategory, sourceMod.Id);
-            if (!JotunnBridge.TryAddPieceCategory(stableCategoryKey, out Piece.PieceCategory createdCategory))
-            {
-                ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogWarning($"Could not create Jotunn category '{stableCategoryKey}'. Falling back to vanilla category '{baseCategory}'.");
-                return baseCategory;
-            }
-
-            ModCategoryCache[cacheKey] = new ModCategoryInfo(createdCategory, baseCategory, sourceMod);
-            return createdCategory;
-        }
     }
 
     private static string ResolveCategoryDisplayLabel(Piece.PieceCategory category, string baseLabel)
@@ -1054,26 +1027,6 @@ internal static class FeasterFoodInjector
         return true;
     }
 
-    private static string BuildStableCategoryKey(Piece.PieceCategory baseCategory, string modId)
-    {
-        string categoryKey = baseCategory switch
-        {
-            Piece.PieceCategory.Food => "food",
-            Piece.PieceCategory.Meads => "meads",
-            Piece.PieceCategory.Feasts => "feasts",
-            _ => $"cat{(int)baseCategory}"
-        };
-
-        int modHash = StringExtensionMethods.GetStableHashCode(modId ?? string.Empty);
-        if (modHash == int.MinValue)
-        {
-            modHash = int.MaxValue;
-        }
-
-        modHash = Math.Abs(modHash);
-        return $"syr_{categoryKey}_{modHash}";
-    }
-
     private static string GetFallbackCategoryLabel(Piece.PieceCategory category)
     {
         return category switch
@@ -1102,9 +1055,9 @@ internal static class FeasterFoodInjector
             return true;
         }
 
-        if (JotunnBridge.TryGetPrefabSourceMod(prefabName, out FoodSourceMod jotunnMod))
+        if (FoodSourceCatalog.TryGetOwner(prefabName, out FoodSourceMod catalogMod))
         {
-            sourceMod = jotunnMod;
+            sourceMod = catalogMod;
             SourceModHitCache[prefabName] = sourceMod;
             return true;
         }
@@ -1176,20 +1129,6 @@ internal sealed class FeastRoutingData
     public HashSet<string> ResultPrefabNames { get; }
 }
 
-internal sealed class ModCategoryInfo
-{
-    public ModCategoryInfo(Piece.PieceCategory category, Piece.PieceCategory baseCategory, FoodSourceMod sourceMod)
-    {
-        Category = category;
-        BaseCategory = baseCategory;
-        SourceMod = sourceMod;
-    }
-
-    public Piece.PieceCategory Category { get; }
-    public Piece.PieceCategory BaseCategory { get; }
-    public FoodSourceMod SourceMod { get; }
-}
-
 internal static class KnownCloneSourceBridge
 {
     private const string WackyGuid = "WackyMole.WackysDatabase";
@@ -1253,158 +1192,6 @@ internal static class KnownCloneSourceBridge
         {
             _wackyGetClonedMap = null;
             ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogDebug($"Known clone source bridge init failed: {ex.Message}");
-        }
-    }
-}
-
-internal static class JotunnBridge
-{
-    private static bool _initialized;
-    private static bool _available;
-    private static MethodInfo? _modQueryEnable;
-    private static MethodInfo? _modQueryGetPrefab;
-    private static PropertyInfo? _pieceManagerInstance;
-    private static MethodInfo? _pieceManagerAddPieceCategory;
-
-    public static void InitializeAndEnableModQuery()
-    {
-        if (_initialized)
-        {
-            EnableModQuery();
-            return;
-        }
-
-        _initialized = true;
-        try
-        {
-            Type? modQueryType = Type.GetType("Jotunn.Utils.ModQuery, Jotunn");
-            Type? pieceManagerType = Type.GetType("Jotunn.Managers.PieceManager, Jotunn");
-
-            _modQueryEnable = modQueryType?.GetMethod("Enable", BindingFlags.Public | BindingFlags.Static);
-            _modQueryGetPrefab = modQueryType?.GetMethod("GetPrefab", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
-            _pieceManagerInstance = pieceManagerType?.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-            _pieceManagerAddPieceCategory = pieceManagerType?.GetMethod("AddPieceCategory", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(string) }, null);
-
-            _available = _modQueryEnable != null &&
-                         _modQueryGetPrefab != null &&
-                         _pieceManagerInstance != null &&
-                         _pieceManagerAddPieceCategory != null;
-        }
-        catch (Exception ex)
-        {
-            _available = false;
-            ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogWarning($"Failed to initialize Jotunn bridge: {ex.Message}");
-        }
-
-        if (!_available)
-        {
-            ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogWarning("Jotunn bridge is unavailable. Mod-specific tabs will fall back to vanilla categories.");
-            return;
-        }
-
-        EnableModQuery();
-    }
-
-    public static bool TryGetPrefabSourceMod(string prefabName, out FoodSourceMod sourceMod)
-    {
-        sourceMod = default;
-        if (!_available || _modQueryGetPrefab == null)
-        {
-            return false;
-        }
-
-        try
-        {
-            object? modPrefab = _modQueryGetPrefab.Invoke(null, new object[] { prefabName });
-            if (modPrefab == null)
-            {
-                return false;
-            }
-
-            object? sourceModObj = modPrefab.GetType().GetProperty("SourceMod", BindingFlags.Public | BindingFlags.Instance)?.GetValue(modPrefab);
-            if (sourceModObj == null)
-            {
-                return false;
-            }
-
-            if (sourceModObj is BepInPlugin plugin)
-            {
-                string pluginName = string.IsNullOrWhiteSpace(plugin.Name) ? plugin.GUID : plugin.Name;
-                sourceMod = new FoodSourceMod(plugin.GUID, pluginName);
-                return true;
-            }
-
-            string? guid = sourceModObj.GetType().GetProperty("GUID", BindingFlags.Public | BindingFlags.Instance)?.GetValue(sourceModObj) as string;
-            string? name = sourceModObj.GetType().GetProperty("Name", BindingFlags.Public | BindingFlags.Instance)?.GetValue(sourceModObj) as string;
-            string guidValue = guid ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(guidValue))
-            {
-                return false;
-            }
-
-            string nameValue = string.IsNullOrWhiteSpace(name) ? guidValue : name!;
-            sourceMod = new FoodSourceMod(guidValue, nameValue);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogDebug($"ModQuery.GetPrefab failed for '{prefabName}': {ex.Message}");
-            return false;
-        }
-    }
-
-    public static bool TryAddPieceCategory(string categoryName, out Piece.PieceCategory category)
-    {
-        category = Piece.PieceCategory.Food;
-        if (!_available || _pieceManagerInstance == null || _pieceManagerAddPieceCategory == null)
-        {
-            return false;
-        }
-
-        try
-        {
-            object? manager = _pieceManagerInstance.GetValue(null);
-            if (manager == null)
-            {
-                return false;
-            }
-
-            object? result = _pieceManagerAddPieceCategory.Invoke(manager, new object[] { categoryName });
-            if (result is Piece.PieceCategory pieceCategory)
-            {
-                category = pieceCategory;
-                return true;
-            }
-
-            if (result is int categoryValue)
-            {
-                category = (Piece.PieceCategory)categoryValue;
-                return true;
-            }
-
-            return false;
-        }
-        catch (Exception ex)
-        {
-            ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogWarning($"Failed to add Jotunn piece category '{categoryName}': {ex.Message}");
-            return false;
-        }
-    }
-
-    private static void EnableModQuery()
-    {
-        if (!_available || _modQueryEnable == null)
-        {
-            return;
-        }
-
-        try
-        {
-            _modQueryEnable.Invoke(null, null);
-        }
-        catch (Exception ex)
-        {
-            ServerSyncModTemplatePlugin.ServerSyncModTemplateLogger.LogWarning($"Failed to enable Jotunn ModQuery: {ex.Message}");
         }
     }
 }
